@@ -4,6 +4,8 @@ OS-Memory 讓 Claude Code 像人一樣**持續學習、逐步遺忘**：每次 s
 
 靈感來自 Hermes agents 的記憶架構。純 Bash + JSONL 實作，唯一相依是 [`jq`](https://jqlang.org)。
 
+> 📖 **完整操作手冊請見 [USAGE.md](USAGE.md)** — 安裝、日常使用、CLI 參考、實戰演練、設定情境與疑難排解。本 README 專注於架構與設計。
+
 ## 核心概念
 
 每條記憶是一筆 JSONL 記錄，帶有分數與狀態，有效強度隨時間指數衰減：
