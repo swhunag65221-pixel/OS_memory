@@ -126,11 +126,11 @@ Slash commands: /remember /reflect /forget /memory-review /memory-status
 </os-memory-digest>
 ```
 
-每條格式為 `[id | 狀態 | 有效強度]`。只顯示有效強度 ≥ `digest_min_score`（預設 1.0）的記憶，每層最多 `digest_max_entries`（預設 40）條；`pinned` 記憶永遠顯示。分類固定排序：pitfall → fix → convention → preference → workflow → fact → insight（保護性知識優先）。
+每條格式為 `[id | 狀態 | 有效強度]`。只顯示有效強度 ≥ `digest_min_score`（預設 1.0）的記憶，每層最多 `digest_max_entries`（預設 40）條；`pinned` 記憶永遠顯示——不受強度門檻限制，也不會被條數上限擠掉（上限的剩餘名額才分給其他記憶）。分類固定排序：pitfall → fix → convention → preference → workflow → fact → insight（保護性知識優先）。
 
 digest 注入時也會順便檢查是否距上次衰減結算超過 24 小時，是的話自動跑一次 `consolidate`（純腳本、零 token）。
 
-記憶累積 5 條以上且超過 14 天未審查時，digest 底部會出現提醒：
+記憶累積 5 條以上而**從未審查過**時，digest 底部立即出現提醒；審查過的則在距上次審查超過 `review_interval_days`（預設 14 天）後再次提醒：
 
 ```
 NOTE: project store has 12 memories and has never been reviewed — consider running /memory-review.
@@ -339,22 +339,25 @@ consolidated global store: kept 1, archived 0, purged 0
 ```bash
 MEM=".claude/os-memory/scripts/memory.sh"
 
-# 1. 學到一條經驗（candidate，score 3，半衰期 14 天）
+# 1. 學到兩條經驗（都是 candidate，score 3，半衰期 14 天）
 bash "$MEM" add --category pitfall "Never run migrations without a backup"
+bash "$MEM" add --category insight "A second lesson that never gets used"
 
-# 2. 下個 session 它出現在 digest；真的有用 → 強化兩次 → verified（半衰期變 90 天）
+# 2. 第一條真的有用 → 強化兩次 → verified（半衰期變 90 天）；第二條保持 candidate
 bash "$MEM" reinforce m260709xxxxxx
 bash "$MEM" reinforce m260709xxxxxx      # → status verified
 
-# 3. 模擬 40 天沒用到：candidate 會被封存，verified 活著
+# 3. 模擬 40 天沒用到：candidate 被封存，verified 活著
 OS_MEMORY_NOW=$(( $(date +%s) + 40*86400 )) bash "$MEM" consolidate
 # consolidated project store: kept 1, archived 1, purged 0
+#（若也裝了帳戶層，會多一行 consolidated global store: ...）
 
 # 4. 檢視封存區（還沒真正消失，60 天內都可以人工救回）
 bash "$MEM" list --archived
 
 # 5. 模擬 200 天後：封存區被永久清除（真正遺忘）
 OS_MEMORY_NOW=$(( $(date +%s) + 200*86400 )) bash "$MEM" consolidate
+# consolidated project store: kept 1, archived 0, purged 1
 ```
 
 用預設參數換算成直覺時間感：
@@ -399,6 +402,8 @@ OS_MEMORY_NOW=$(( $(date +%s) + 200*86400 )) bash "$MEM" consolidate
 { "auto_reflect": false }
 ```
 
+注意：反思相關設定（`auto_reflect`、`reflect_min_transcript_bytes`）只讀**一份** config——專案有安裝時讀專案層，帳戶層的值只在沒有專案層安裝的目錄生效。要關掉某個專案的自動反思，改**該專案**的 config.json。（digest 相關設定則是兩層各自獨立。）
+
 **「反思觸發太頻繁／太少」** — 調整工作量門檻（單位：bytes）：
 
 ```json
@@ -436,7 +441,7 @@ OS_MEMORY_NOW=$(( $(date +%s) + 200*86400 )) bash "$MEM" consolidate
 不會。兩層的 hooks 都會啟動，但以 session 為單位的 marker（存於 `${TMPDIR:-/tmp}/os-memory-<uid>/`）保證 digest 只注入一次、反思只觸發一次，且內容本來就是兩層合併的。
 
 **`jq is required` 錯誤？**
-裝 jq：`brew install jq`（macOS）/ `sudo apt install jq`（Debian/Ubuntu）。jq 不在時 hooks 靜默跳過，不會弄壞 session。
+裝 jq：`brew install jq`（macOS）/ `sudo apt install jq`（Debian/Ubuntu）。jq 不在時 hooks 靜默跳過（exit 0），不會弄壞 session；其他指令會明確報錯，`doctor` 會標示 `jq: MISSING`。
 
 **誤刪了記憶？**
 60 天寬限期內都在封存區：`bash "$MEM" list --archived` 找到那條，手動把該行從 `archive.jsonl` 搬回 `memory.jsonl`（刪掉 `archived_at` 與 `archive_reason` 欄位即可）。
@@ -464,7 +469,9 @@ rm ~/projects/myapp/.claude/commands/{remember,reflect,forget,memory-review,memo
 ## 11. 附錄：檔案位置與資料格式
 
 ```
-<專案>/.claude/                         （帳戶層為 ~/.claude/，結構相同）
+<專案>/.claude/                         （帳戶層為 ~/.claude/，結構相同；
+                                          差別：說明區塊寫在 ~/.claude/CLAUDE.md，
+                                          專案層則寫在專案根目錄的 CLAUDE.md）
 ├── settings.json                       hooks 註冊（SessionStart、Stop）
 ├── commands/                           五個 slash 指令
 │   ├── remember.md  reflect.md  forget.md

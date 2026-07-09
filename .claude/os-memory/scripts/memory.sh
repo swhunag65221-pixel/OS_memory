@@ -21,7 +21,8 @@ OSM_VERSION="1.0.0"
 err() { printf 'os-memory: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
 
-command -v jq >/dev/null 2>&1 || die "jq is required (https://jqlang.org)"
+HAS_JQ=1
+command -v jq >/dev/null 2>&1 || HAS_JQ=0
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$SELF_DIR/memory.sh"
@@ -404,7 +405,10 @@ digest_store() { # <store> <title>
     | map(. + {eff: eff})
     | map(select(.status == "pinned" or .eff >= $cfg.digest_min_score))
     | sort_by(-.eff)
-    | .[0:$cfg.digest_max_entries]
+    # pinned entries are never cut by the cap; remaining slots go to the strongest rest
+    | (map(select(.status == "pinned"))) as $pinned
+    | ($pinned + (map(select(.status != "pinned"))
+                  | .[0:([($cfg.digest_max_entries - ($pinned | length)), 0] | max)]))
     | group_by(.category)
     | sort_by(.[0].category as $c | (($order | index($c)) // 99))
     | map("### " + .[0].category + "\n"
@@ -598,7 +602,12 @@ cmd_mark_reviewed() {
 
 cmd_doctor() {
   echo "OS-Memory v$OSM_VERSION"
-  echo "jq: $(jq --version)"
+  if [ "$HAS_JQ" = "1" ]; then
+    echo "jq: $(jq --version)"
+  else
+    echo "jq: MISSING — required; hooks are silently disabled until installed (https://jqlang.org)"
+    return 0
+  fi
   echo "clock: $NOW_ISO"
   if [ -n "$PROJECT_STORE" ]; then
     echo "project store: $PROJECT_STORE ($(count_lines "$PROJECT_STORE/memory.jsonl") active, $(count_lines "$PROJECT_STORE/archive.jsonl") archived)"
@@ -714,6 +723,14 @@ EOF
 main() {
   local cmd="${1:-help}"
   [ $# -gt 0 ] && shift
+  if [ "$HAS_JQ" != "1" ]; then
+    case "$cmd" in
+      # A missing jq must never break the user's session — hooks skip silently.
+      hook-session-start|hook-stop) exit 0 ;;
+      doctor|help|--help|-h|version) ;;
+      *) die "jq is required (https://jqlang.org)" ;;
+    esac
+  fi
   case "$cmd" in
     add)                cmd_add "$@" ;;
     recall)             cmd_recall "$@" ;;
