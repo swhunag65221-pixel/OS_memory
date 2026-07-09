@@ -620,7 +620,7 @@ cmd_doctor() {
     echo "global store:  not installed (run install.sh --global)"
   fi
   local f
-  for f in "${PROJECT_STORE:+$(dirname "$(dirname "$PROJECT_STORE")")/settings.json}" "$HOME/.claude/settings.json"; do
+  for f in "${PROJECT_STORE:+$(dirname "$PROJECT_STORE")/settings.json}" "$HOME/.claude/settings.json"; do
     [ -n "$f" ] && [ -f "$f" ] || continue
     if grep -q 'hook-session-start' "$f" 2>/dev/null; then
       echo "hooks registered in: $f"

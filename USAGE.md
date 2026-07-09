@@ -201,6 +201,8 @@ MEM="$CLAUDE_PROJECT_DIR/.claude/os-memory/scripts/memory.sh"   # 專案層
 [ -f "$MEM" ] || MEM="$HOME/.claude/os-memory/scripts/memory.sh" # 帳戶層 fallback
 ```
 
+CLI 如何定位專案層：優先看環境變數 `$CLAUDE_PROJECT_DIR`（Claude Code 的 hooks 會自動設定），否則從**目前目錄**向上尋找 `.claude/os-memory/`——與腳本檔案本身放在哪無關。因此在專案目錄之外執行時，`--scope auto` 的寫入會落到帳戶層；請在專案內執行，或先 `export CLAUDE_PROJECT_DIR=/path/to/project`。
+
 ### `add` — 新增記憶
 
 ```bash
@@ -329,6 +331,8 @@ consolidated global store: kept 1, archived 0, purged 0
 | `doctor` | 健康檢查（同 `install.sh --doctor`） |
 | `help` | 完整指令說明 |
 | `version` | 印出版本 |
+| `hook-session-start` | 內部用：SessionStart hook 進入點（從 stdin 讀 hook JSON），即 settings.json 註冊的指令 |
+| `hook-stop` | 內部用：Stop hook 進入點（自動反思提示），即 settings.json 註冊的指令 |
 
 環境變數：`OS_MEMORY_GLOBAL_DIR` 覆蓋帳戶層位置（預設 `~/.claude/os-memory`）；`OS_MEMORY_NOW`（epoch 秒）覆蓋時鐘，供測試衰減用。
 
@@ -376,7 +380,7 @@ OS_MEMORY_NOW=$(( $(date +%s) + 200*86400 )) bash "$MEM" consolidate
 
 1. **新增時直接存帳戶層**：`bash "$MEM" add --scope global --category preference "..."` —— 適合一開始就知道是通用經驗的。
 2. **事後升級**：`bash "$MEM" promote <id>` —— 專案裡驗證過、發現放諸四海皆準時。`/memory-review` 也會主動做這件事。
-3. **團隊共享**：把專案的記憶資料檔 commit 進 git（見下方 FAQ），團隊成員 clone 後即共享專案記憶。
+3. **團隊共享**：把專案的記憶資料檔 commit 進 git（見第 9 節「記憶檔要不要 commit？」），團隊成員 clone 後即共享專案記憶。
 
 範圍判斷原則：**跟這個 repo 綁定的**（慣例、架構、特定坑）留專案層；**跟「你」綁定的**（偏好、通用工作流、工具使用心得）放帳戶層。
 
@@ -418,6 +422,8 @@ OS_MEMORY_NOW=$(( $(date +%s) + 200*86400 )) bash "$MEM" consolidate
 
 改完即刻生效（下次 recall / consolidate 就用新值），不需重新安裝。
 
+改完建議跑一次 `jq . .claude/os-memory/config.json` 驗證：若檔案不是合法 JSON，指令不會中斷，但會在 stderr 警告 `invalid JSON — using defaults` 並以**全部預設值**執行（你的所有自訂值都會被忽略）。
+
 ## 9. 疑難排解
 
 第一步永遠是：
@@ -444,7 +450,7 @@ OS_MEMORY_NOW=$(( $(date +%s) + 200*86400 )) bash "$MEM" consolidate
 裝 jq：`brew install jq`（macOS）/ `sudo apt install jq`（Debian/Ubuntu）。jq 不在時 hooks 靜默跳過（exit 0），不會弄壞 session；其他指令會明確報錯，`doctor` 會標示 `jq: MISSING`。
 
 **誤刪了記憶？**
-60 天寬限期內都在封存區：`bash "$MEM" list --archived` 找到那條，手動把該行從 `archive.jsonl` 搬回 `memory.jsonl`（刪掉 `archived_at` 與 `archive_reason` 欄位即可）。
+60 天寬限期內都在封存區：`bash "$MEM" list --archived` 找到那條，手動把該行從 `archive.jsonl` 搬回 `memory.jsonl`（刪掉 `archived_at` 與 `archive_reason` 欄位），然後**務必 `bash "$MEM" reinforce <id>` 一次**——刷新衰減時鐘。否則因衰減（`decayed`）被封存的記憶，其舊時間戳會讓它在下次結算時立刻再度被封存。
 
 **記憶檔要不要 commit？**
 本 repo 的 `.gitignore` 預設忽略自身的記憶資料（範本保持乾淨）。你的專案裡兩種選擇都合理：commit → 團隊／多機共享；不 commit → 在專案 `.gitignore` 加上三行（見 README FAQ）。
@@ -503,6 +509,6 @@ rm ~/projects/myapp/.claude/commands/{remember,reflect,forget,memory-review,memo
 }
 ```
 
-封存記錄額外帶 `archived_at` 與 `archive_reason`：`decayed`（自然衰減）、`manual`（forget）、`weakened-to-zero`（削弱歸零）。
+被 `weaken --reason` 削弱過的記錄會多一個 `last_weaken_reason` 欄位（最近一次的削弱原因）。封存記錄額外帶 `archived_at` 與 `archive_reason`：`decayed`（自然衰減）、`manual`（forget）、`weakened-to-zero`（削弱歸零）。
 
 有效強度公式：`eff = score × 0.5 ^ (距上次 reinforced 的天數 / 該狀態半衰期)`。
