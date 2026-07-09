@@ -1,0 +1,21 @@
+{
+  "score_initial": 3.0,
+  "score_max": 10.0,
+  "reinforce_bonus": 1.0,
+  "weaken_penalty": 1.5,
+  "verify_wins": 2,
+  "half_life_days": {
+    "candidate": 14,
+    "verified": 90,
+    "pinned": 36500
+  },
+  "digest_min_score": 1.0,
+  "digest_max_entries": 40,
+  "archive_threshold": 0.5,
+  "purge_archive_after_days": 60,
+  "consolidate_interval_hours": 24,
+  "review_interval_days": 14,
+  "auto_reflect": true,
+  "reflect_min_transcript_bytes": 60000,
+  "max_new_memories_per_session": 3
+}

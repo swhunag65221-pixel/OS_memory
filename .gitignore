@@ -1,0 +1,6 @@
+# OS-Memory runtime data — this repo is the distributable template, so its own
+# memory stays local. In your projects, committing these files is a valid
+# choice if you want to share memory across machines/teammates (see README).
+.claude/os-memory/memory.jsonl
+.claude/os-memory/archive.jsonl
+.claude/os-memory/state.json
