@@ -38,7 +38,7 @@
 ### 需求
 
 - `bash` 3.2+（macOS 內建版本即可）
-- `jq` 1.5+（`brew install jq` / `apt install jq`）
+- `jq` 1.6+（`brew install jq` / `apt install jq`）
 
 ### 裝到單一專案
 
@@ -197,17 +197,23 @@ Claude：找到 m260709e49367 "API error responses always use the ProblemDetails
 所有操作也可以直接下 CLI（對 Claude 與對你都一樣）。腳本位置：
 
 ```bash
-MEM="$CLAUDE_PROJECT_DIR/.claude/os-memory/scripts/memory.sh"   # 專案層
-[ -f "$MEM" ] || MEM="$HOME/.claude/os-memory/scripts/memory.sh" # 帳戶層 fallback
+d="${CLAUDE_PROJECT_DIR:-$PWD}"; MEM=""
+while [ -n "$d" ] && [ "$d" != "/" ]; do
+  [ -f "$d/.claude/os-memory/scripts/memory.sh" ] && { MEM="$d/.claude/os-memory/scripts/memory.sh"; break; }
+  d="$(dirname "$d")"
+done
+[ -n "$MEM" ] || MEM="$HOME/.claude/os-memory/scripts/memory.sh"   # 帳戶層 fallback
 ```
 
-CLI 如何定位專案層：優先看環境變數 `$CLAUDE_PROJECT_DIR`（Claude Code 的 hooks 會自動設定），否則從**目前目錄**向上尋找 `.claude/os-memory/`——與腳本檔案本身放在哪無關。因此在專案目錄之外執行時，`--scope auto` 的寫入會落到帳戶層；請在專案內執行，或先 `export CLAUDE_PROJECT_DIR=/path/to/project`。
+（`$CLAUDE_PROJECT_DIR` 只在 hooks 環境存在，一般指令環境通常沒有，所以上面的片段從目前目錄向上尋找。）執行哪一份 memory.sh 其實不影響結果——腳本在執行時自行解析專案層與帳戶層：優先看 `$CLAUDE_PROJECT_DIR`，否則從**目前目錄**向上尋找 `.claude/os-memory/`。因此在專案目錄之外執行時，`--scope auto` 的寫入會落到帳戶層；請在專案內執行，或先 `export CLAUDE_PROJECT_DIR=/path/to/project`。
 
 ### `add` — 新增記憶
 
 ```bash
-bash "$MEM" add [--scope project|global] [--category CAT] [--context TXT] [--status S] "lesson"
+bash "$MEM" add [--scope project|global] [--category CAT] [--context TXT] [--status S] [--] "lesson"
 ```
+
+內容以 `-`/`--` 開頭時（例如關於 CLI 旗標的經驗），在內容前加 `--` 分隔：`bash "$MEM" add --category pitfall -- "--force pushes rewrite teammate history"`。
 
 | 旗標 | 預設 | 說明 |
 |---|---|---|
@@ -241,7 +247,7 @@ reinforced m260709fcde1e → score 5, wins 2, status verified
 
 ### `weaken <id> [--reason TXT]` — 削弱（記憶錯誤）
 
--1.5 分（下限 0）、`losses` +1、記錄原因；**不會**刷新衰減時鐘（錯誤的記憶要死得快）。扣到 0 立即封存：
+-1.5 分（下限 0）、`losses` +1、記錄原因；**不會**刷新衰減時鐘（錯誤的記憶要死得快）。扣到 0 立即封存。`pinned` 記憶會被拒絕（需先 `unpin`），確保「pinned 永不封存」的保證成立：
 
 ```console
 $ bash "$MEM" weaken m26070955029b --reason "proven incorrect"
@@ -259,18 +265,18 @@ forgot m260709e49367 (archived; purged permanently after grace period)
 
 ### `pin <id>` / `unpin <id>` — 釘選／解除
 
-`pin` 讓記憶豁免衰減且永遠出現在 digest（請節制，只用於關鍵不變量）；`unpin` 恢復為 `verified`。
+`pin` 讓記憶豁免衰減且永遠出現在 digest（請節制，只用於關鍵不變量）；pinned 記憶對 `weaken` 與 `forget` 都會被拒絕，需先 `unpin`。`unpin` 恢復為 `verified` 並**重設衰減時鐘**（否則 pin 期間會被追溯計入衰減時間）。
 
 ### `promote <id>` — 升級到帳戶層
 
-把專案記憶搬到帳戶層（所有專案共享）。帳戶層已有相同內容時自動合併（強化帳戶層那條、移除專案層副本）：
+把專案記憶搬到帳戶層（所有專案共享）。帳戶層已有相同內容時自動合併（強化帳戶層那條、移除專案層副本）；帳戶層已有相同 **id**（如透過 git 同步造成）時，搬移的記錄會換發新 id 並在輸出中註明：
 
 ```console
 $ bash "$MEM" promote m260709648459
 promoted m260709648459 to account-wide memory (shared across projects)
 ```
 
-### `recall [--hook]` — 印出 digest
+### `recall` — 印出 digest
 
 輸出與 session 開始注入的內容相同，可隨時手動檢視。也會觸發到期的自動結算。
 

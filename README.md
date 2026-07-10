@@ -45,7 +45,7 @@ OS-Memory 讓 Claude Code 像人一樣**持續學習、逐步遺忘**：每次 s
 
 ## 安裝
 
-需求：`bash` 3.2+、`jq` 1.5+。
+需求：`bash` 3.2+、`jq` 1.6+。
 
 ```bash
 git clone https://github.com/swhunag65221-pixel/os_memory.git
@@ -74,7 +74,7 @@ cd os_memory
 
 ## 運作方式（全自動）
 
-1. **Session 開始** — SessionStart hook 將記憶 digest 注入 context：兩層記憶合併、按有效強度排序、只取強度 ≥ 1.0 的前 40 條，並附上維護指引。同時每 24 小時自動跑一次 consolidate（衰減結算）。
+1. **Session 開始** — SessionStart hook 將記憶 digest 注入 context：兩層記憶合併、按有效強度排序、每層各取強度 ≥ 1.0 的前 40 條（pinned 永遠保留），並附上維護指引。同時每 24 小時自動跑一次 consolidate（衰減結算）。
 2. **工作中** — Claude 依照 digest 指引隨手維護：用到且有幫助就 `reinforce`、發現錯誤就 `weaken`、學到重要經驗就 `add`。
 3. **Session 結束** — Stop hook 檢查這個 session 是否有實質工作量（transcript 大小門檻），是的話擋下一次，要求 Claude 反思：強化有用的、削弱錯誤的、最多存 3 條新經驗。每個 session 只觸發一次，不會無限循環。
 4. **定期審查** — 記憶超過 14 天未審查時，digest 會提示執行 `/memory-review`：Claude 會合併重複、修剪過時、歸納通則、把通用經驗 promote 到帳戶層——相當於「睡眠中的記憶鞏固」。

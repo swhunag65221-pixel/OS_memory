@@ -1,12 +1,19 @@
 ---
 description: Show OS-Memory statistics and the strongest memories
 ---
+<!-- os-memory:command -->
 Show the current state of OS-Memory.
 
-1. Locate the memory script:
+1. Locate the memory script — walk up from the current directory (note:
+   $CLAUDE_PROJECT_DIR is usually NOT set in this environment), then fall back
+   to the account-wide install:
    ```bash
-   MEM="$CLAUDE_PROJECT_DIR/.claude/os-memory/scripts/memory.sh"
-   [ -f "$MEM" ] || MEM="$HOME/.claude/os-memory/scripts/memory.sh"
+   d="${CLAUDE_PROJECT_DIR:-$PWD}"; MEM=""
+   while [ -n "$d" ] && [ "$d" != "/" ]; do
+     [ -f "$d/.claude/os-memory/scripts/memory.sh" ] && { MEM="$d/.claude/os-memory/scripts/memory.sh"; break; }
+     d="$(dirname "$d")"
+   done
+   [ -n "$MEM" ] || MEM="$HOME/.claude/os-memory/scripts/memory.sh"
    ```
 2. Gather data:
    ```bash

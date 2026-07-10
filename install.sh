@@ -29,6 +29,19 @@ die() { err "$*"; exit 1; }
 command -v jq >/dev/null 2>&1 || die "jq is required (https://jqlang.org)"
 [ -f "$SRC/os-memory/scripts/memory.sh" ] || die "source tree not found next to install.sh"
 
+# Refuse to touch a settings.json whose hooks have an unexpected shape.
+# Runs BEFORE any file is copied, so a bad file aborts cleanly instead of
+# leaving a half-installed state.
+validate_settings() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  jq -e . "$f" >/dev/null 2>&1 || die "$f is not valid JSON — fix it and re-run"
+  jq -e '(.hooks // {}) | type == "object"' "$f" >/dev/null 2>&1 \
+    || die "$f: .hooks is not an object — fix it manually and re-run"
+  jq -e '[(.hooks // {})[]? | type == "array"] | all' "$f" >/dev/null 2>&1 \
+    || die "$f: a .hooks event entry is not an array — fix it manually and re-run"
+}
+
 # merge_hook <settings.json> <event> <command> — append the hook entry unless
 # an identical command is already registered.
 merge_hook() {
@@ -70,8 +83,9 @@ EOF
 
 # install_into <claude_dir> <path_prefix_literal> <claude_md> <scope label>
 install_into() {
-  local cdir="$1" prefix="$2" cmd_md="$3" scope="$4" f
+  local cdir="$1" prefix="$2" cmd_md="$3" scope="$4" f dest
 
+  validate_settings "$cdir/settings.json"
   mkdir -p "$cdir/os-memory/scripts" "$cdir/commands"
   cp "$SRC/os-memory/scripts/memory.sh" "$cdir/os-memory/scripts/memory.sh"
   chmod +x "$cdir/os-memory/scripts/memory.sh"
@@ -81,7 +95,14 @@ install_into() {
   [ -f "$cdir/os-memory/state.json" ] || printf '{}\n' > "$cdir/os-memory/state.json"
 
   for f in "$SRC"/commands/*.md; do
-    cp "$f" "$cdir/commands/$(basename "$f")"
+    dest="$cdir/commands/$(basename "$f")"
+    # never clobber a user's own command file of the same name — only files
+    # carrying the os-memory:command marker are ours to overwrite on upgrade
+    if [ -f "$dest" ] && ! grep -qF 'os-memory:command' "$dest"; then
+      err "warning: $dest exists and is not an OS-Memory file — left untouched"
+      continue
+    fi
+    cp "$f" "$dest"
   done
 
   merge_hook "$cdir/settings.json" SessionStart \
@@ -105,6 +126,8 @@ case "${1:-}" in
     [ -d "$TARGET" ] || die "no such directory: $TARGET"
     TARGET="$(cd "$TARGET" && pwd)"
     [ "$TARGET" != "$HOME" ] || die "use --global to install account-wide"
+    [ "$TARGET" != "$SRC_DIR" ] \
+      || die "this is the OS-Memory source repo — its .claude/ tree is already live; point --project at another project"
     install_into "$TARGET/.claude" '$CLAUDE_PROJECT_DIR' "$TARGET/CLAUDE.md" "project: $TARGET"
     echo
     echo "New Claude Code sessions in this project now load and maintain memory automatically."

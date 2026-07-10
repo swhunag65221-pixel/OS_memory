@@ -12,11 +12,11 @@
 # whose effective strength falls below a threshold, and permanently purges
 # archived entries after a grace period — a two-stage forgetting curve.
 #
-# Requires: bash 3.2+, jq 1.5+.
+# Requires: bash 3.2+, jq 1.6+ (round, try/catch).
 
 set -euo pipefail
 
-OSM_VERSION="1.0.0"
+OSM_VERSION="1.1.0"
 
 err() { printf 'os-memory: %s\n' "$*" >&2; }
 die() { err "$*"; exit 1; }
@@ -34,6 +34,11 @@ NOW_ISO="$(date -u -d "@$NOW_EPOCH" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
         || date -u -r "$NOW_EPOCH" +%Y-%m-%dT%H:%M:%SZ)"
 ID_DATE="$(date -u -d "@$NOW_EPOCH" +%y%m%d 2>/dev/null \
         || date -u -r "$NOW_EPOCH" +%y%m%d)"
+
+# Single source of truth for memory categories — used by validation, the
+# digest ordering, and every instruction string shown to the model.
+CATEGORIES="pitfall fix convention preference workflow fact insight"
+CATEGORIES_PIPE="$(printf '%s' "$CATEGORIES" | tr ' ' '|')"
 
 GLOBAL_STORE="${OS_MEMORY_GLOBAL_DIR:-$HOME/.claude/os-memory}"
 
@@ -78,10 +83,11 @@ count_lines() {
 load_config() {
   local f="$1/config.json" user='{}'
   if [ -f "$f" ]; then
-    if jq -e . "$f" >/dev/null 2>&1; then
-      user="$(cat "$f")"
-    else
-      err "warning: invalid JSON in $f — using defaults"
+    # -e turns a null output (valid JSON but not an object) into a nonzero
+    # exit, so both parse errors and wrong-type configs fall back to defaults
+    if ! user="$(jq -c -e 'if type == "object" then . else null end' "$f" 2>/dev/null)"; then
+      err "warning: invalid config.json in $f (must be a JSON object) — using defaults"
+      user='{}'
     fi
   fi
   jq -c -n --argjson u "$user" '{
@@ -104,16 +110,24 @@ load_config() {
 }
 
 # Shared jq definitions. Callers must pass --argjson cfg and --argjson now.
+# A record with a missing or malformed timestamp gets age 0 (full strength)
+# instead of aborting the whole pass — surfacing beats bricking recall.
 JQ_DEFS='
 def hl: ($cfg.half_life_days[.status] // $cfg.half_life_days.candidate);
-def age_days: (($now - ((.reinforced // .created) | fromdateiso8601)) / 86400);
+def ts: (((.reinforced // .created // "") | tostring | (try fromdateiso8601 catch null)) // $now);
+def age_days: (($now - ts) / 86400);
 def eff: if .status == "pinned" then .score
          else .score * ((age_days / hl) * -0.6931471805599453 | exp) end;
+def keep: (.status == "pinned" or eff >= $cfg.archive_threshold);
 '
 
+# Prints the marker directory, or fails (rc=1) when it cannot be created or
+# written (e.g. pre-owned by another user on a shared machine). Callers must
+# degrade gracefully — markers must never break the user's session.
 markers_dir() {
   local d="${TMPDIR:-/tmp}/os-memory-$(id -u 2>/dev/null || echo 0)"
-  mkdir -p "$d"
+  mkdir -p "$d" 2>/dev/null || return 1
+  [ -w "$d" ] || return 1
   printf '%s\n' "$d"
 }
 
@@ -140,22 +154,31 @@ id_count() { # <id> <store>
 }
 
 store_of_id() { # <id> → prints store path, rc=1 if not found
-  local s
+  local s found=""
   for s in "$PROJECT_STORE" "$GLOBAL_STORE"; do
     [ -n "$s" ] && [ -f "$s/memory.jsonl" ] || continue
     if [ "$(id_count "$1" "$s")" -gt 0 ]; then
-      printf '%s\n' "$s"
-      return 0
+      if [ -z "$found" ]; then
+        found="$s"
+      else
+        err "warning: $1 exists in both stores — operating on the $(store_label "$found") copy"
+      fi
     fi
   done
-  return 1
+  [ -n "$found" ] || return 1
+  printf '%s\n' "$found"
 }
 
-gen_id() { # <store>
-  local id
+gen_id() { # ids must be unique across BOTH stores — mutations match by id
+  local id s taken
   while :; do
     id="m${ID_DATE}$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
-    if [ "$(id_count "$id" "$1")" -eq 0 ]; then
+    taken=0
+    for s in "$PROJECT_STORE" "$GLOBAL_STORE"; do
+      [ -n "$s" ] && [ -f "$s/memory.jsonl" ] || continue
+      [ "$(id_count "$id" "$s")" -eq 0 ] || { taken=1; break; }
+    done
+    if [ "$taken" -eq 0 ]; then
       printf '%s\n' "$id"
       return 0
     fi
@@ -180,16 +203,21 @@ cmd_add() {
       --category|-c)   category="$2"; shift 2 ;;
       --context)       context="$2"; shift 2 ;;
       --status)        status="$2"; shift 2 ;;
-      --*)             die "add: unknown flag: $1" ;;
+      --)              shift
+                       while [ $# -gt 0 ]; do
+                         if [ -z "$content" ]; then content="$1"; else content="$content $1"; fi
+                         shift
+                       done ;;
+      --*)             die "add: unknown flag: $1 (put -- before content that starts with a dash)" ;;
       *)               if [ -z "$content" ]; then content="$1"; else content="$content $1"; fi; shift ;;
     esac
   done
   [ -n "$content" ] || die 'add: content required — memory.sh add [--category CAT] "lesson"'
 
   category="$(printf '%s' "$category" | tr '[:upper:]' '[:lower:]')"
-  case "$category" in
-    pitfall|fix|convention|preference|workflow|fact|insight) ;;
-    *) err "note: non-standard category '$category' (standard: pitfall fix convention preference workflow fact insight)" ;;
+  case " $CATEGORIES " in
+    *" $category "*) ;;
+    *) err "note: non-standard category '$category' (standard: $CATEGORIES)" ;;
   esac
   case "$status" in
     candidate|verified|pinned) ;;
@@ -261,6 +289,10 @@ cmd_weaken() {
   [ -n "$id" ] || die "weaken: id required"
   local store
   store="$(store_of_id "$id")" || die "weaken: memory not found: $id"
+  # honour the documented guarantee: pinned memories are never archived/purged
+  if [ "$(jq -s -r --arg id "$id" 'map(select(.id == $id)) | .[0].status' "$store/memory.jsonl")" = "pinned" ]; then
+    die "weaken: $id is pinned — pinned memories never decay or get archived; run 'unpin $id' first"
+  fi
   local cfg; cfg="$(load_config "$store")"
   rewrite "$store" '
     map(if .id == $id then
@@ -271,7 +303,7 @@ cmd_weaken() {
     --arg id "$id" --arg reason "$reason" --argjson cfg "$cfg"
   local newscore
   newscore="$(jq -s -r --arg id "$id" 'map(select(.id == $id)) | .[0].score' "$store/memory.jsonl")"
-  if [ "$(jq -n --argjson s "$newscore" '$s <= 0')" = "true" ]; then
+  if awk -v s="$newscore" 'BEGIN { exit !(s <= 0) }'; then
     archive_id "$store" "$id" "weakened-to-zero"
     echo "weakened $id → score 0 — forgotten (archived)"
   else
@@ -284,6 +316,9 @@ cmd_forget() {
   [ -n "$id" ] || die "forget: id required"
   local store
   store="$(store_of_id "$id")" || die "forget: memory not found: $id"
+  if [ "$(jq -s -r --arg id "$id" 'map(select(.id == $id)) | .[0].status' "$store/memory.jsonl")" = "pinned" ]; then
+    die "forget: $id is pinned — run 'unpin $id' first, then forget it"
+  fi
   archive_id "$store" "$id" "manual"
   echo "forgot $id (archived; purged permanently after grace period)"
 }
@@ -302,8 +337,11 @@ cmd_unpin() {
   [ -n "$id" ] || die "unpin: id required"
   local store
   store="$(store_of_id "$id")" || die "unpin: memory not found: $id"
-  rewrite "$store" 'map(if .id == $id then .status = "verified" else . end)' --arg id "$id"
-  echo "unpinned $id (now verified, decays normally)"
+  # restart the decay clock — otherwise the whole pinned period counts as
+  # elapsed decay time and the next consolidate archives the entry instantly
+  rewrite "$store" 'map(if .id == $id then .status = "verified" | .reinforced = $iso else . end)' \
+    --arg id "$id" --arg iso "$NOW_ISO"
+  echo "unpinned $id (now verified; decay clock restarted)"
 }
 
 cmd_promote() {
@@ -321,18 +359,25 @@ cmd_promote() {
     cmd_reinforce "$dup"
     return 0
   fi
-  jq -s -c --arg id "$id" \
-    'map(select(.id == $id) | .scope = "global" | .project = "-") | .[]' \
+  local newid="$id"
+  if [ "$(id_count "$id" "$GLOBAL_STORE")" -gt 0 ]; then
+    # same id already lives in the global store (e.g. via a git-synced project
+    # file) — renaming avoids one id addressing two unrelated records
+    newid="$(gen_id "$GLOBAL_STORE")"
+    err "note: $id already exists in the global store — promoted copy renamed to $newid"
+  fi
+  jq -s -c --arg id "$id" --arg newid "$newid" \
+    'map(select(.id == $id) | .id = $newid | .scope = "global" | .project = "-") | .[]' \
     "$PROJECT_STORE/memory.jsonl" >> "$GLOBAL_STORE/memory.jsonl"
   rewrite "$PROJECT_STORE" 'map(select(.id != $id))' --arg id "$id"
-  echo "promoted $id to account-wide memory (shared across projects)"
+  echo "promoted $newid to account-wide memory (shared across projects)"
 }
 
-consolidate_store() { # <store> <auto:0|1> <quiet:0|1>
-  local store="$1" auto="$2" quiet="$3"
+consolidate_store() { # <store> <auto:0|1> <quiet:0|1> [cfg-json]
+  local store="$1" auto="$2" quiet="$3" cfg="${4:-}"
   [ -d "$store" ] || return 0
   ensure_store "$store"
-  local cfg; cfg="$(load_config "$store")"
+  [ -n "$cfg" ] || cfg="$(load_config "$store")"
 
   if [ "$auto" = "1" ]; then
     local last interval_h last_epoch age_h
@@ -348,10 +393,10 @@ consolidate_store() { # <store> <auto:0|1> <quiet:0|1>
   local tmp_keep tmp_arch archived kept
   tmp_keep="$(mktemp)"; tmp_arch="$(mktemp)"
   jq -s -c --argjson cfg "$cfg" --argjson now "$NOW_EPOCH" "$JQ_DEFS"'
-    .[] | select(.status == "pinned" or eff >= $cfg.archive_threshold)' \
+    .[] | select(keep)' \
     "$store/memory.jsonl" > "$tmp_keep"
   jq -s -c --argjson cfg "$cfg" --argjson now "$NOW_EPOCH" --arg iso "$NOW_ISO" "$JQ_DEFS"'
-    .[] | select((.status == "pinned" or eff >= $cfg.archive_threshold) | not)
+    .[] | select(keep | not)
         | . + {archived_at: $iso, archive_reason: "decayed"}' \
     "$store/memory.jsonl" > "$tmp_arch"
   archived="$(count_lines "$tmp_arch")"
@@ -364,7 +409,8 @@ consolidate_store() { # <store> <auto:0|1> <quiet:0|1>
   arch_before="$(count_lines "$store/archive.jsonl")"
   tmp_purge="$(mktemp)"
   jq -s -c --argjson cfg "$cfg" --argjson now "$NOW_EPOCH" '
-    .[] | select((($now - ((.archived_at // .created) | fromdateiso8601)) / 86400)
+    .[] | select((($now - (((.archived_at // .created // "") | tostring
+                            | (try fromdateiso8601 catch null)) // $now)) / 86400)
                  <= $cfg.purge_archive_after_days)' \
     "$store/archive.jsonl" > "$tmp_purge"
   mv "$tmp_purge" "$store/archive.jsonl"
@@ -382,8 +428,7 @@ cmd_consolidate() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --quiet) quiet=1; shift ;;
-      --force) shift ;;  # manual consolidate always runs; flag kept for symmetry
-      *)       shift ;;
+      *)       die "consolidate: unknown argument: $1 (manual consolidate always runs immediately)" ;;
     esac
   done
   local ran=0 s
@@ -395,13 +440,13 @@ cmd_consolidate() {
   [ "$ran" = "1" ] || err "no memory store found — nothing to consolidate"
 }
 
-digest_store() { # <store> <title>
-  local store="$1" title="$2"
+digest_store() { # <store> <title> [cfg-json]
+  local store="$1" title="$2" cfg="${3:-}"
   [ -s "$store/memory.jsonl" ] || return 0
-  local cfg body
-  cfg="$(load_config "$store")"
-  body="$(jq -s -r --argjson cfg "$cfg" --argjson now "$NOW_EPOCH" "$JQ_DEFS"'
-    ["pitfall","fix","convention","preference","workflow","fact","insight"] as $order
+  local body
+  [ -n "$cfg" ] || cfg="$(load_config "$store")"
+  body="$(jq -s -r --argjson cfg "$cfg" --argjson now "$NOW_EPOCH" --arg cats "$CATEGORIES" "$JQ_DEFS"'
+    ($cats | split(" ")) as $order
     | map(. + {eff: eff})
     | map(select(.status == "pinned" or .eff >= $cfg.digest_min_score))
     | sort_by(-.eff)
@@ -422,13 +467,13 @@ digest_store() { # <store> <title>
   printf '## %s\n\n%s\n\n' "$title" "$body"
 }
 
-review_notice() { # <store>
-  local store="$1"
+review_notice() { # <store> [cfg-json]
+  local store="$1" cfg="${2:-}"
   [ -s "$store/memory.jsonl" ] || return 0
-  local count cfg interval last
+  local count interval last
   count="$(count_lines "$store/memory.jsonl")"
   [ "$count" -ge 5 ] || return 0
-  cfg="$(load_config "$store")"
+  [ -n "$cfg" ] || cfg="$(load_config "$store")"
   interval="$(jq -r '.review_interval_days' <<<"$cfg")"
   last="$(jq -r '.last_review // empty' "$store/state.json" 2>/dev/null || true)"
   if [ -z "$last" ]; then
@@ -444,7 +489,7 @@ review_notice() { # <store>
 }
 
 cmd_recall() {
-  while [ $# -gt 0 ]; do shift; done  # --hook accepted; output is identical
+  [ $# -eq 0 ] || die "recall: unknown argument: $1"
 
   local stores=() titles=()
   if [ -n "$PROJECT_STORE" ]; then
@@ -457,22 +502,25 @@ cmd_recall() {
   fi
   [ "${#stores[@]}" -gt 0 ] || return 0
 
-  local i sections="" notices="" n body maxnew cfg
+  local i sections="" notices="" n body maxnew cfg cfg_first=""
   for i in "${!stores[@]}"; do
-    consolidate_store "${stores[$i]}" 1 1
+    # load each store's config once and pass it down — this path runs at
+    # every session start, so redundant jq spawns directly cost startup time
+    cfg="$(load_config "${stores[$i]}")"
+    [ -n "$cfg_first" ] || cfg_first="$cfg"
+    consolidate_store "${stores[$i]}" 1 1 "$cfg"
     # command substitution strips trailing newlines — re-add the separator
-    body="$(digest_store "${stores[$i]}" "${titles[$i]}")"
+    body="$(digest_store "${stores[$i]}" "${titles[$i]}" "$cfg")"
     [ -n "$body" ] && sections="$sections$body
 
 "
-    n="$(review_notice "${stores[$i]}")" || true
+    n="$(review_notice "${stores[$i]}" "$cfg")" || true
     [ -n "$n" ] && notices="$notices$n
 "
   done
   [ -n "$sections" ] || { [ -n "$notices" ] && printf '%s' "$notices"; return 0; }
 
-  cfg="$(load_config "${stores[0]}")"
-  maxnew="$(jq -r '.max_new_memories_per_session' <<<"$cfg")"
+  maxnew="$(jq -r '.max_new_memories_per_session' <<<"$cfg_first")"
 
   cat <<EOF
 <os-memory-digest>
@@ -483,7 +531,7 @@ you work — this is how learning happens:
 - A memory below proved helpful → bash "$SELF" reinforce <id>
 - A memory below is wrong or outdated → bash "$SELF" weaken <id> --reason "why"
 - You learned a durable, non-obvious lesson (max $maxnew per session; skip trivia) →
-  bash "$SELF" add --category <pitfall|fix|convention|preference|workflow|fact|insight> [--scope global] [--context "detail"] "<one-sentence lesson in English>"
+  bash "$SELF" add --category <$CATEGORIES_PIPE> [--scope global] [--context "detail"] -- "<one-sentence lesson in English>"
 Slash commands: /remember /reflect /forget /memory-review /memory-status
 
 $sections${notices}</os-memory-digest>
@@ -632,26 +680,44 @@ cmd_doctor() {
 # ------------------------------------------------------------------ hooks
 
 cmd_hook_session_start() {
-  local input session_id src marker_dir marker
+  local input parsed session_id src marker_dir claim ts
   input="$(cat 2>/dev/null || true)"
-  session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null || echo unknown)"
-  src="$(printf '%s' "$input" | jq -r '.source // "startup"' 2>/dev/null || echo startup)"
+  parsed="$(printf '%s' "$input" \
+    | jq -r '[(.session_id // "unknown"), (.source // "startup")] | @tsv' 2>/dev/null)" || parsed=""
+  [ -n "$parsed" ] || parsed="$(printf 'unknown\tstartup')"
+  session_id="${parsed%%$'\t'*}"
+  src="${parsed#*$'\t'}"
   # On resume the previous context (which already contains the digest) is
   # restored, so re-injecting would duplicate it.
   [ "$src" = "resume" ] && return 0
-  marker_dir="$(markers_dir)"
-  marker="$marker_dir/recall-$session_id-$src"
-  # Both a global and a project install may fire this hook — first one wins.
-  [ -e "$marker" ] && return 0
-  : > "$marker"
-  find "$marker_dir" -type f -mtime +7 -delete 2>/dev/null || true
-  cmd_recall --hook
+  # Dedupe concurrent injections (a global and a project install both fire this
+  # hook) with an atomic mkdir claim plus a short TTL: a fresh claim suppresses
+  # the duplicate, while a later event with the same source — e.g. a SECOND
+  # context compaction — is past the TTL and re-injects. If markers are
+  # unavailable, prefer a possible duplicate over injecting no memory at all.
+  if marker_dir="$(markers_dir)"; then
+    claim="$marker_dir/recall-$session_id-$src.d"
+    if ! mkdir "$claim" 2>/dev/null; then
+      ts="$(cat "$claim/ts" 2>/dev/null || echo 0)"
+      case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+      [ $((NOW_EPOCH - ts)) -lt 60 ] && return 0
+    fi
+    printf '%s' "$NOW_EPOCH" > "$claim/ts" 2>/dev/null || true
+    find "$marker_dir" -mindepth 1 -mtime +30 -delete 2>/dev/null || true
+  fi
+  cmd_recall
 }
 
 cmd_hook_stop() {
-  local input active store cfg session_id marker transcript min size maxnew
+  local input parsed active rest store cfg session_id marker_dir marker transcript min size maxnew
   input="$(cat 2>/dev/null || true)"
-  active="$(printf '%s' "$input" | jq -r '.stop_hook_active // false' 2>/dev/null || echo false)"
+  parsed="$(printf '%s' "$input" \
+    | jq -r '[(.stop_hook_active // false | tostring), (.session_id // "unknown"), (.transcript_path // "")] | @tsv' 2>/dev/null)" || parsed=""
+  [ -n "$parsed" ] || parsed="$(printf 'false\tunknown\t')"
+  active="${parsed%%$'\t'*}"
+  rest="${parsed#*$'\t'}"
+  session_id="${rest%%$'\t'*}"
+  transcript="${rest#*$'\t'}"
   [ "$active" = "true" ] && return 0
 
   if [ -n "$PROJECT_STORE" ]; then store="$PROJECT_STORE"
@@ -660,24 +726,25 @@ cmd_hook_stop() {
   cfg="$(load_config "$store")"
   [ "$(jq -r '.auto_reflect' <<<"$cfg")" = "true" ] || return 0
 
-  session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"' 2>/dev/null || echo unknown)"
-  marker="$(markers_dir)/reflect-$session_id"
+  # Without a usable marker dir we cannot guarantee once-per-session, so skip
+  # the nudge entirely rather than re-firing it on every Stop.
+  marker_dir="$(markers_dir)" || return 0
+  marker="$marker_dir/reflect-$session_id"
   [ -e "$marker" ] && return 0
 
-  transcript="$(printf '%s' "$input" | jq -r '.transcript_path // empty' 2>/dev/null || true)"
   [ -n "$transcript" ] && [ -f "$transcript" ] || return 0
   min="$(jq -r '.reflect_min_transcript_bytes' <<<"$cfg")"
   size="$(wc -c < "$transcript" | tr -d '[:space:]')"
   [ "$size" -ge "$min" ] || return 0
 
-  : > "$marker"
+  : > "$marker" 2>/dev/null || true
   maxnew="$(jq -r '.max_new_memories_per_session' <<<"$cfg")"
   local reason
   reason="[OS-Memory] Automatic end-of-session reflection (fires once per session).
 Before giving your final reply, update long-term memory (script: $SELF):
 1. Reinforce digest memories that actually helped this session: bash \"$SELF\" reinforce <id>
 2. Weaken digest memories that proved wrong or outdated: bash \"$SELF\" weaken <id> --reason \"why\"
-3. Save at most $maxnew genuinely durable new lessons, one self-contained English sentence each: bash \"$SELF\" add --category <pitfall|fix|convention|preference|workflow|fact|insight> [--scope global] [--context \"detail\"] \"<lesson>\"
+3. Save at most $maxnew genuinely durable new lessons, one self-contained English sentence each: bash \"$SELF\" add --category <$CATEGORIES_PIPE> [--scope global] [--context \"detail\"] -- \"<lesson>\"
 Worth saving: pitfalls you hit and their fixes, corrections from the user, verified project facts and conventions, stated user preferences. Not worth saving: trivia, one-off details, anything already in the digest.
 If nothing qualifies, save nothing. Then finish your reply."
   jq -n --arg r "$reason" '{decision: "block", reason: $r}'
@@ -692,17 +759,19 @@ OS-Memory v$OSM_VERSION — long-term memory for Claude Code with human-like dec
 Usage: memory.sh <command> [args]
 
 Memory commands:
-  add [--scope project|global] [--category CAT] [--context TXT] [--status S] "lesson"
-                          Save a memory (dedupes: identical content is reinforced)
+  add [--scope project|global] [--category CAT] [--context TXT] [--status S] [--] "lesson"
+                          Save a memory (dedupes: identical content is
+                          reinforced; use -- before content starting with a dash)
   reinforce <id>          Memory proved useful: +score, refresh decay clock
   weaken <id> [--reason TXT]
-                          Memory proved wrong: -score (score 0 → forgotten)
-  forget <id>             Archive a memory immediately
-  pin <id> / unpin <id>   Exempt from / restore decay
+                          Memory proved wrong: -score (score 0 → forgotten;
+                          pinned memories must be unpinned first)
+  forget <id>             Archive a memory immediately (pinned: unpin first)
+  pin <id> / unpin <id>   Exempt from / restore decay (unpin restarts the clock)
   promote <id>            Move a project memory to the account-wide store
 
 Recall & curation:
-  recall [--hook]         Print the memory digest (what sessions see at start)
+  recall                  Print the memory digest (what sessions see at start)
   search <text>           Find memories by content
   list [--all|--archived] Table of memories with effective scores
   stats                   Store statistics
@@ -716,7 +785,7 @@ Internals:
 
 Env: OS_MEMORY_GLOBAL_DIR (default ~/.claude/os-memory)
      OS_MEMORY_NOW (epoch seconds; overrides clock, for testing)
-Categories: pitfall fix convention preference workflow fact insight
+Categories: $CATEGORIES
 EOF
 }
 
